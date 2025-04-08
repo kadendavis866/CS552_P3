@@ -54,3 +54,5 @@ dkms.conf
 /myprogram
 /build
 /.vscode/c_cpp_properties.json
+
+/target
