@@ -84,7 +84,7 @@ impl BuddyPool {
         if kval < MIN_K {
             kval = MIN_K;
         }
-        if kval > MAX_K {
+        if kval >= MAX_K {
             kval = MAX_K - 1;
         }
 
@@ -129,20 +129,6 @@ impl BuddyPool {
         m.prev = &mut self.avail[self.kval_m] as *mut Avail;
     }
 
-    /// Find the buddy of a given pointer and kval relative to the base address we got from memmap2
-    ///
-    /// # Arguments
-    /// * buddy - The memory block that we want to find the buddy for
-    ///
-    /// # Returns
-    /// a pointer to the buddy
-    fn buddy_calc(&self, avail: &Avail) -> *mut Avail {
-        let mut addr = (avail as *const Avail).addr();
-        addr -= self.base.as_ptr().addr();
-        let mask = (1u64 << avail.kval) as usize;
-        unsafe { self.base.as_ptr().offset((addr ^ mask) as isize) as *mut Avail }
-    }
-
     /// Allocates a block of size bytes of memory, returning a pointer to the beginning of the
     /// block. The content of the newly allocated block of memory is not initialized, remaining with
     /// indeterminate values.
@@ -156,54 +142,6 @@ impl BuddyPool {
         let avail_size = size_of::<Avail>();
         let kval = b_to_k(size + avail_size);
         unsafe { Ok((self.malloc_kval(kval)? as *mut u8).offset(avail_size as isize)) }
-    }
-
-    /// Allocates a block of memory of size 2^k bytes, returning a pointer to the Avail struct at
-    /// the start of the block. This is in contrast to the malloc function which returns a pointer
-    /// to the start of usable user memory.
-    ///
-    /// # Arguments
-    /// * kval - The size of the requested block in K values
-    ///
-    /// # Returns
-    /// a pointer to the Avail struct at the start of the block
-    unsafe fn malloc_kval(&mut self, kval: usize) -> Result<*mut Avail, BuddyError> {
-        if kval > self.kval_m {
-            set_errno(ENOMEM);
-            return Err(BuddyError::NoMemory);
-        }
-        if self.avail[kval].next as *const Avail != &self.avail[kval] {
-            let block = self.avail[kval].next;
-            self.remove_from_avail(&mut *block);
-            return Ok(block);
-        }
-        //No blocks available at this kval, try to split a larger block
-        let larger_block = self.malloc_kval(kval + 1)?;
-        Ok(self.split(&mut *larger_block))
-    }
-
-    /// Splits a block of memory into two smaller blocks. This function will return a pointer to the
-    /// block with the lowest address, the other block will be added to the Avail list. The returned
-    /// block will be tagged as reserved and not added to the avail list.
-    ///
-    /// # Arguments
-    /// * avail - The block of memory to split
-    ///
-    /// # Returns
-    /// a pointer to the block with the lowest address after the split
-    fn split<'a>(&mut self, avail: &'a mut Avail) -> &'a mut Avail {
-        let kval = avail.kval;
-        avail.kval -= 1;
-        avail.tag = BLOCK_RESERVED;
-        let buddy = self.buddy_calc(avail);
-        unsafe {
-            ptr::write(buddy, Avail::new());
-            let buddy = &mut *buddy;
-            buddy.kval = kval - 1;
-            buddy.tag = BLOCK_AVAIL;
-            self.add_to_avail(buddy);
-        }
-        avail
     }
 
     /// A block of memory previously allocated by a call to malloc, realloc is
@@ -227,77 +165,6 @@ impl BuddyPool {
                 .unwrap();
             self.free_avail(avail);
         }
-    }
-
-    /// Frees a block of memory previously allocated by a call to malloc, realloc. This function
-    /// should only be used internally as it takes as an argument the reference to the Avail struct,
-    /// not the pointer to user memory.
-    unsafe fn free_avail(&mut self, avail: &mut Avail) {
-        let mut avail = avail;
-        let mut buddy_o = self.get_avail_buddy(avail);
-        while buddy_o.is_some() {
-            let buddy = buddy_o.unwrap() as *mut Avail;
-            self.remove_from_avail(&mut *buddy);
-            if (avail as *mut Avail) < buddy {
-                avail.kval += 1;
-            } else {
-                (*buddy).kval += 1;
-                avail = &mut *buddy;
-            }
-            buddy_o = self.get_avail_buddy(avail);
-        }
-        self.add_to_avail(avail);
-    }
-
-    /// Adds a block of memory to the avail list and tags it as available.
-    ///
-    /// # Arguments
-    /// * avail - The block of memory to add to the avail list
-    fn add_to_avail(&mut self, avail: &mut Avail) {
-        let kval = avail.kval;
-        avail.prev = self.avail[kval].prev;
-        avail.next = &mut self.avail[kval];
-        unsafe {
-            (*self.avail[kval].prev).next = avail;
-        }
-        self.avail[kval].prev = avail;
-        avail.tag = BLOCK_AVAIL;
-    }
-
-    /// Removes a block of memory from the avail list and tags it as reserved.
-    ///
-    /// # Arguments
-    /// * avail - The block of memory to remove from the avail list
-    fn remove_from_avail(&mut self, avail: &mut Avail) {
-        unsafe {
-            (*avail.next).prev = avail.prev;
-            (*avail.prev).next = avail.next;
-        }
-        avail.tag = BLOCK_RESERVED;
-        avail.next = ptr::null_mut();
-        avail.prev = ptr::null_mut();
-    }
-
-    /// Gets the buddy of a block of memory. This function will return None if the buddy is not
-    /// tagged as available. This is most useful in coalescing blocks during a free operation.
-    ///
-    /// # Arguments
-    /// * avail - The block of memory to get the buddy for
-    ///
-    /// # Returns
-    /// a reference to the buddy block if it is available, otherwise None
-    fn get_avail_buddy(&self, avail: &Avail) -> Option<&mut Avail> {
-        if avail.kval == self.kval_m {
-            return None;
-        }
-        let buddy = unsafe { self.buddy_calc(avail).as_mut().unwrap() };
-        if buddy.tag != BLOCK_AVAIL {
-            return None;
-        }
-        if buddy.kval != avail.kval {
-            return None;
-        }
-        Some(buddy)
     }
 
     /// Changes the size of the memory block pointed to by ptr. The function may move the memory
@@ -359,6 +226,139 @@ impl BuddyPool {
             }
         }
         Ok(ptr)
+    }
+
+    /// Adds a block of memory to the avail list and tags it as available.
+    ///
+    /// # Arguments
+    /// * avail - The block of memory to add to the avail list
+    fn add_to_avail(&mut self, avail: &mut Avail) {
+        let kval = avail.kval;
+        avail.prev = self.avail[kval].prev;
+        avail.next = &mut self.avail[kval];
+        unsafe {
+            (*self.avail[kval].prev).next = avail;
+        }
+        self.avail[kval].prev = avail;
+        avail.tag = BLOCK_AVAIL;
+    }
+
+    /// Removes a block of memory from the avail list and tags it as reserved.
+    ///
+    /// # Arguments
+    /// * avail - The block of memory to remove from the avail list
+    fn remove_from_avail(&mut self, avail: &mut Avail) {
+        unsafe {
+            (*avail.next).prev = avail.prev;
+            (*avail.prev).next = avail.next;
+        }
+        avail.tag = BLOCK_RESERVED;
+        avail.next = ptr::null_mut();
+        avail.prev = ptr::null_mut();
+    }
+
+    /// Find the buddy of a given pointer and kval relative to the base address we got from memmap2
+    ///
+    /// # Arguments
+    /// * buddy - The memory block that we want to find the buddy for
+    ///
+    /// # Returns
+    /// a pointer to the buddy
+    fn buddy_calc(&self, avail: &Avail) -> *mut Avail {
+        let mut addr = (avail as *const Avail).addr();
+        addr -= self.base.as_ptr().addr();
+        let mask = (1u64 << avail.kval) as usize;
+        unsafe { self.base.as_ptr().offset((addr ^ mask) as isize) as *mut Avail }
+    }
+
+    /// Splits a block of memory into two smaller blocks. This function will return a pointer to the
+    /// block with the lowest address, the other block will be added to the Avail list. The returned
+    /// block will be tagged as reserved and not added to the avail list.
+    ///
+    /// # Arguments
+    /// * avail - The block of memory to split
+    ///
+    /// # Returns
+    /// a pointer to the block with the lowest address after the split
+    fn split<'a>(&mut self, avail: &'a mut Avail) -> &'a mut Avail {
+        let kval = avail.kval;
+        avail.kval -= 1;
+        avail.tag = BLOCK_RESERVED;
+        let buddy = self.buddy_calc(avail);
+        unsafe {
+            ptr::write(buddy, Avail::new());
+            let buddy = &mut *buddy;
+            buddy.kval = kval - 1;
+            buddy.tag = BLOCK_AVAIL;
+            self.add_to_avail(buddy);
+        }
+        avail
+    }
+
+    /// Gets the buddy of a block of memory. This function will return None if the buddy is not
+    /// tagged as available. This is most useful in coalescing blocks during a free operation.
+    ///
+    /// # Arguments
+    /// * avail - The block of memory to get the buddy for
+    ///
+    /// # Returns
+    /// a reference to the buddy block if it is available, otherwise None
+    fn get_avail_buddy(&self, avail: &Avail) -> Option<&mut Avail> {
+        if avail.kval == self.kval_m {
+            return None;
+        }
+        let buddy = unsafe { self.buddy_calc(avail).as_mut().unwrap() };
+        if buddy.tag != BLOCK_AVAIL {
+            return None;
+        }
+        if buddy.kval != avail.kval {
+            return None;
+        }
+        Some(buddy)
+    }
+
+    /// Allocates a block of memory of size 2^k bytes, returning a pointer to the Avail struct at
+    /// the start of the block. This is in contrast to the malloc function which returns a pointer
+    /// to the start of usable user memory.
+    ///
+    /// # Arguments
+    /// * kval - The size of the requested block in K values
+    ///
+    /// # Returns
+    /// a pointer to the Avail struct at the start of the block
+    unsafe fn malloc_kval(&mut self, kval: usize) -> Result<*mut Avail, BuddyError> {
+        if kval > self.kval_m {
+            set_errno(ENOMEM);
+            return Err(BuddyError::NoMemory);
+        }
+        if self.avail[kval].next as *const Avail != &self.avail[kval] {
+            let block = self.avail[kval].next;
+            self.remove_from_avail(&mut *block);
+            return Ok(block);
+        }
+        //No blocks available at this kval, try to split a larger block
+        let larger_block = self.malloc_kval(kval + 1)?;
+        Ok(self.split(&mut *larger_block))
+    }
+
+    /// Frees a block of memory previously allocated by a call to malloc, realloc. This function
+    /// should only be used internally as it takes as an argument the reference to the Avail struct,
+    /// not the pointer to user memory.
+    unsafe fn free_avail(&mut self, avail: &mut Avail) {
+        let mut avail = avail;
+        let mut buddy_o = self.get_avail_buddy(avail);
+        while buddy_o.is_some() {
+            let buddy = buddy_o.unwrap() as *mut Avail;
+            self.remove_from_avail(&mut *buddy);
+            if (avail as *mut Avail) < buddy {
+                avail.kval += 1;
+            } else {
+                (*buddy).kval += 1;
+                avail = &mut *buddy;
+            }
+            buddy_o = self.get_avail_buddy(avail);
+        }
+        self.add_to_avail(avail);
     }
 }
 
